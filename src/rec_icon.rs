@@ -54,9 +54,9 @@ impl Chain {
             id,
             links: vec![
                 RecIcon::new(Duration::ZERO).alpha(0.0),
-                RecIcon::new(Duration::from_millis(1000)).alpha(1.0),
+                RecIcon::new(Duration::from_secs(1)).alpha(1.0),
                 RecIcon::new(Duration::from_millis(250)).alpha(1.0),
-                RecIcon::new(Duration::from_millis(1000)).alpha(0.0),
+                RecIcon::new(Duration::from_secs(1)).alpha(0.0),
                 RecIcon::new(Duration::from_millis(250)).alpha(0.0),
             ],
         }

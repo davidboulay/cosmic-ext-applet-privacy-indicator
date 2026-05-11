@@ -19,8 +19,8 @@ pub fn open_cameras() -> HashMap<PathBuf, (i32, i32)> {
     }
 
     read_dir("/proc")
-        .and_then(|paths| {
-            let res = paths
+        .map(|paths| {
+            paths
                 .flatten()
                 .filter(|pid| {
                     pid.file_name()
@@ -39,7 +39,7 @@ pub fn open_cameras() -> HashMap<PathBuf, (i32, i32)> {
                         return None;
                     };
                     if path.to_string_lossy().starts_with("/dev/video") {
-                        Some(PathBuf::from(path))
+                        Some(path)
                     } else {
                         None
                     }
@@ -47,8 +47,7 @@ pub fn open_cameras() -> HashMap<PathBuf, (i32, i32)> {
                 .fold(HashMap::<PathBuf, (i32, i32)>::new(), |mut hm, p| {
                     hm.entry(p).and_modify(|fds| fds.0 += 1).or_insert((1, 0));
                     hm
-                });
-            Ok(res)
+                })
         })
         .unwrap_or_default()
 }

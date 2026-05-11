@@ -12,15 +12,19 @@ use cosmic::{
     Application, Apply, Element,
     app::{Core, Task},
     applet::padded_control,
+    cosmic_config,
     cosmic_theme::palette::WithAlpha,
     iced::{
-        Alignment, Background, Border, Length, Subscription, core::layout::Limits, stream::channel,
-        window,
+        Alignment, Background, Border, Length, Subscription,
+        core::layout::Limits,
+        stream::channel,
+        window::{self, Id as PopupId},
     },
+    iced_winit::commands::popup::{destroy_popup, get_popup},
     theme::{Container, Svg, Theme},
     widget::{
-        Column, Row, container::Style as CtnStyle, divider, icon, layer_container, mouse_area,
-        svg::Style as SvgStyle, text,
+        Column, Row, button, container::Style as CtnStyle, divider, icon, layer_container,
+        mouse_area, svg::Style as SvgStyle, text,
     },
 };
 use cosmic_time::{Timeline, anim, chain};
@@ -28,7 +32,10 @@ use cosmic_time::{Timeline, anim, chain};
 use inotify::EventMask;
 use pipewire::{context::ContextRc, main_loop::MainLoopRc};
 
-use crate::camera::{AppInfo, get_inotify, open_cameras, procs_using_camera};
+use crate::{
+    CONFIG_VERSION, Config,
+    camera::{AppInfo, get_inotify, open_cameras, procs_using_camera},
+};
 
 static REC_ICON: LazyLock<crate::rec_icon::Id> = LazyLock::new(crate::rec_icon::Id::unique);
 
@@ -48,11 +55,13 @@ pub struct PrivacyIndicator {
     screenshares: HashMap<u32, AppInfo>,
     cameras: HashMap<PathBuf, (i32, i32)>,
     camera_apps: HashMap<PathBuf, Vec<AppInfo>>,
-    popup: Option<window::Id>,
+    popup: Option<PopupId>,
+    config: Config,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Config(Config),
     Tick,
     RecTick(Instant),
     ScreenShareAdd(u32, AppInfo),
@@ -63,7 +72,7 @@ pub enum Message {
     CameraPrevious(HashMap<PathBuf, (i32, i32)>),
     CameraReset(PathBuf),
     TogglePopup,
-    ClosePopup,
+    ClosePopup(PopupId),
     KillProcess(u32),
 }
 
@@ -85,7 +94,7 @@ impl PrivacyIndicator {
 impl Application for PrivacyIndicator {
     type Executor = cosmic::executor::Default;
 
-    type Flags = ();
+    type Flags = Config;
 
     type Message = Message;
 
@@ -99,22 +108,23 @@ impl Application for PrivacyIndicator {
         &mut self.core
     }
 
-    fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
+    fn init(core: Core, flags: Self::Flags) -> (Self, Task<Self::Message>) {
         let mut timeline = Timeline::new();
         timeline.set_chain(chain![REC_ICON]).start();
 
         let app = PrivacyIndicator {
             core,
             timeline,
+            config: flags,
             ..Default::default()
         };
 
         (app, Task::none())
     }
 
-    fn on_close_requested(&self, id: window::Id) -> Option<Self::Message> {
+    fn on_close_requested(&self, id: PopupId) -> Option<Self::Message> {
         if self.popup == Some(id) {
-            Some(Message::ClosePopup)
+            Some(Message::ClosePopup(id))
         } else {
             None
         }
@@ -212,13 +222,11 @@ impl Application for PrivacyIndicator {
                     }
                     rows.push(padded_control(text::heading($label)).into());
                     for app in $apps {
-                        let kill_btn = cosmic::widget::button::destructive("Kill").on_press_maybe(
-                            if app.pid > 0 {
-                                Some(Message::KillProcess(app.pid))
-                            } else {
-                                None
-                            },
-                        );
+                        let kill_btn = button::destructive("Kill").on_press_maybe(if app.pid > 0 {
+                            Some(Message::KillProcess(app.pid))
+                        } else {
+                            None
+                        });
                         rows.push(
                             padded_control(
                                 Row::new()
@@ -294,7 +302,7 @@ impl Application for PrivacyIndicator {
             }
             Message::TogglePopup => {
                 if let Some(id) = self.popup.take() {
-                    return cosmic::iced_winit::platform_specific::wayland::commands::popup::destroy_popup(id);
+                    return destroy_popup(id);
                 }
                 let new_id = window::Id::unique();
                 self.popup = Some(new_id);
@@ -305,14 +313,11 @@ impl Application for PrivacyIndicator {
                     None,
                     None,
                 );
-                return cosmic::iced_winit::platform_specific::wayland::commands::popup::get_popup(
-                    settings,
-                );
+
+                return get_popup(settings);
             }
-            Message::ClosePopup => {
-                if let Some(id) = self.popup.take() {
-                    return cosmic::iced_winit::platform_specific::wayland::commands::popup::destroy_popup(id);
-                }
+            Message::ClosePopup(id) => {
+                self.popup.take_if(|stored_id| stored_id == &id);
             }
             Message::KillProcess(pid) => {
                 std::process::Command::new("kill")
@@ -320,12 +325,52 @@ impl Application for PrivacyIndicator {
                     .spawn()
                     .ok();
             }
+            Message::Config(config) => self.config = config,
         }
         Task::none()
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        let pw_shares = Subscription::run(|| {
+        let pw_shares = Self::pipewire_subscription();
+        let camera_shares = Self::inotify_subscription();
+        let config = Self::config_subscription();
+        let timeline = if self.config.animated {
+            cosmic::iced::time::every(Duration::from_millis(self.config.refresh))
+                .map(Message::RecTick)
+        } else {
+            Subscription::none()
+        };
+        let tick = cosmic::iced::time::every(Duration::from_secs(2)).map(|_| Message::Tick);
+
+        Subscription::batch([pw_shares, camera_shares, config, timeline, tick])
+    }
+
+    fn style(&self) -> Option<cosmic::iced_runtime::Appearance> {
+        Some(cosmic::applet::style())
+    }
+}
+
+impl PrivacyIndicator {
+    pub fn config_subscription() -> Subscription<Message> {
+        struct ConfigSubscription;
+        cosmic_config::config_subscription(
+            std::any::TypeId::of::<ConfigSubscription>(),
+            Self::APP_ID.into(),
+            CONFIG_VERSION,
+        )
+        .map(|update| {
+            if !update.errors.is_empty() {
+                println!(
+                    "errors loading config {:?}: {:?}",
+                    update.keys, update.errors
+                );
+            }
+            Message::Config(update.config)
+        })
+    }
+
+    fn pipewire_subscription() -> Subscription<Message> {
+        Subscription::run(|| {
             channel(100, |output| async {
                 std::thread::spawn(move || {
                     pipewire::init();
@@ -373,9 +418,9 @@ impl Application for PrivacyIndicator {
                                 let mut out = output.clone();
                                 loop {
                                     match out.try_send(msg.clone()) {
-                                        Ok(_) => break,
+                                        Ok(()) => break,
                                         Err(_) => {
-                                            eprintln!("Failed to send PipeWire event")
+                                            eprintln!("Failed to send PipeWire event");
                                         }
                                     }
                                 }
@@ -385,7 +430,7 @@ impl Application for PrivacyIndicator {
                             let mut out = output_remove.clone();
                             loop {
                                 match out.try_send(Message::PipeWireNodeRemove(id)) {
-                                    Ok(_) => break,
+                                    Ok(()) => break,
                                     Err(_) => eprintln!("Failed to send unshare event"),
                                 }
                             }
@@ -394,15 +439,17 @@ impl Application for PrivacyIndicator {
                     main_loop.run();
                 });
             })
-        });
+        })
+    }
 
-        let camera_shares = Subscription::run(|| {
+    fn inotify_subscription() -> Subscription<Message> {
+        Subscription::run(|| {
             channel(100, |mut output| async {
                 std::thread::spawn(move || {
                     let open_cameras = open_cameras();
                     loop {
                         match output.try_send(Message::CameraPrevious(open_cameras.clone())) {
-                            Ok(_) => break,
+                            Ok(()) => break,
                             Err(_) => eprintln!("Failed to send previously open camera event"),
                         }
                     }
@@ -415,31 +462,30 @@ impl Application for PrivacyIndicator {
                             .expect("Failed to read events")
                         {
                             match event.mask {
-                                EventMask::CREATE | EventMask::ATTRIB | EventMask::DELETE_SELF => {
-                                    if event.mask == EventMask::DELETE_SELF
+                                EventMask::CREATE | EventMask::ATTRIB | EventMask::DELETE_SELF
+                                    if (event.mask == EventMask::DELETE_SELF
                                         || event
                                             .name
                                             .unwrap_or_default()
                                             .to_string_lossy()
-                                            .starts_with("video")
-                                    {
-                                        let old_wd_paths = wd_path;
-                                        (inotify, wd_path) = get_inotify();
-                                        let old_paths = old_wd_paths
-                                            .left_values()
-                                            .collect::<std::collections::HashSet<_>>();
-                                        let new_paths = wd_path
-                                            .left_values()
-                                            .collect::<std::collections::HashSet<_>>();
-                                        for &path in old_paths.difference(&new_paths) {
-                                            loop {
-                                                match output
-                                                    .try_send(Message::CameraReset(path.clone()))
-                                                {
-                                                    Ok(_) => break,
-                                                    Err(_) => eprintln!(
-                                                        "Failed to send camera reset event"
-                                                    ),
+                                            .starts_with("video")) =>
+                                {
+                                    let old_wd_paths = wd_path;
+                                    (inotify, wd_path) = get_inotify();
+                                    let old_paths = old_wd_paths
+                                        .left_values()
+                                        .collect::<std::collections::HashSet<_>>();
+                                    let new_paths = wd_path
+                                        .left_values()
+                                        .collect::<std::collections::HashSet<_>>();
+                                    for &path in old_paths.difference(&new_paths) {
+                                        loop {
+                                            match output
+                                                .try_send(Message::CameraReset(path.clone()))
+                                            {
+                                                Ok(()) => break,
+                                                Err(_) => {
+                                                    eprintln!("Failed to send camera reset event");
                                                 }
                                             }
                                         }
@@ -451,9 +497,9 @@ impl Application for PrivacyIndicator {
                                         let msg = Message::CameraOpen(path.clone(), apps);
                                         loop {
                                             match output.try_send(msg.clone()) {
-                                                Ok(_) => break,
+                                                Ok(()) => break,
                                                 Err(_) => {
-                                                    eprintln!("Failed to send camera open event")
+                                                    eprintln!("Failed to send camera open event");
                                                 }
                                             }
                                         }
@@ -465,30 +511,20 @@ impl Application for PrivacyIndicator {
                                         let msg = Message::CameraClose(path.clone(), apps);
                                         loop {
                                             match output.try_send(msg.clone()) {
-                                                Ok(_) => break,
+                                                Ok(()) => break,
                                                 Err(_) => {
-                                                    eprintln!("Failed to send camera close event")
+                                                    eprintln!("Failed to send camera close event");
                                                 }
                                             }
                                         }
                                     });
                                 }
-                                _ => continue,
-                            };
+                                _ => {}
+                            }
                         }
                     }
                 });
             })
-        });
-
-        // Weirdly enough, self.timeline.as_subscription() is too resource heavy, since it follows the compositors refresh rate
-        let timeline = cosmic::iced::time::every(Duration::from_millis(20)).map(Message::RecTick); // 50Hz
-        let tick = cosmic::iced::time::every(Duration::from_millis(2000)).map(|_| Message::Tick);
-
-        Subscription::batch([pw_shares, camera_shares, timeline, tick])
-    }
-
-    fn style(&self) -> Option<cosmic::iced_runtime::Appearance> {
-        Some(cosmic::applet::style())
+        })
     }
 }
