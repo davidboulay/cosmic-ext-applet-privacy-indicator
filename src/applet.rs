@@ -33,7 +33,7 @@ use inotify::EventMask;
 use pipewire::{context::ContextRc, main_loop::MainLoopRc};
 
 use crate::{
-    CONFIG_VERSION, Config,
+    Config,
     camera::{AppInfo, get_inotify, open_cameras, procs_using_camera},
 };
 
@@ -41,9 +41,9 @@ static REC_ICON: LazyLock<crate::rec_icon::Id> = LazyLock::new(crate::rec_icon::
 
 #[derive(Default)]
 struct Shared {
-    microphone: Vec<AppInfo>,
-    screenshare: Vec<AppInfo>,
-    camera: Vec<AppInfo>,
+    pub microphone: bool,
+    pub screenshare: bool,
+    pub camera: bool,
 }
 
 #[derive(Default)]
@@ -54,41 +54,24 @@ pub struct PrivacyIndicator {
     microphones: HashMap<u32, AppInfo>,
     screenshares: HashMap<u32, AppInfo>,
     cameras: HashMap<PathBuf, (i32, i32)>,
-    camera_apps: HashMap<PathBuf, Vec<AppInfo>>,
     popup: Option<PopupId>,
     config: Config,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Config(Config),
     Tick,
     RecTick(Instant),
     ScreenShareAdd(u32, AppInfo),
     MicrophoneAdd(u32, AppInfo),
     PipeWireNodeRemove(u32),
-    CameraOpen(PathBuf, Vec<AppInfo>),
-    CameraClose(PathBuf, Vec<AppInfo>),
+    CameraOpen(PathBuf),
+    CameraClose(PathBuf),
     CameraPrevious(HashMap<PathBuf, (i32, i32)>),
     CameraReset(PathBuf),
     TogglePopup,
     ClosePopup(PopupId),
     KillProcess(u32),
-}
-
-impl PrivacyIndicator {
-    fn refresh_shared(&mut self) {
-        self.shared = Shared {
-            microphone: self.microphones.values().cloned().collect(),
-            screenshare: self.screenshares.values().cloned().collect(),
-            camera: self
-                .cameras
-                .iter()
-                .filter(|(_, (shares, min))| shares - min > 0)
-                .flat_map(|(path, _)| self.camera_apps.get(path).cloned().unwrap_or_default())
-                .collect(),
-        };
-    }
 }
 
 impl Application for PrivacyIndicator {
@@ -139,9 +122,9 @@ impl Application for PrivacyIndicator {
             microphone,
             screenshare,
             camera,
-        } = &self.shared;
+        } = self.shared;
 
-        if microphone.is_empty() && screenshare.is_empty() && camera.is_empty() {
+        if !microphone && !screenshare && !camera {
             return self
                 .core
                 .applet
@@ -162,13 +145,13 @@ impl Application for PrivacyIndicator {
                 .size(size.0)
         };
 
-        if !camera.is_empty() {
+        if camera {
             icons.push(indicator("camera-web-symbolic").into());
         }
-        if !microphone.is_empty() {
+        if microphone {
             icons.push(indicator("audio-input-microphone-symbolic").into());
         }
-        if !screenshare.is_empty() {
+        if screenshare {
             icons.push(indicator("accessories-screenshot-symbolic").into());
         }
 
@@ -206,11 +189,13 @@ impl Application for PrivacyIndicator {
     }
 
     fn view_window(&self, _id: window::Id) -> Element<'_, Self::Message> {
-        let Shared {
-            microphone,
-            screenshare,
-            camera,
-        } = &self.shared;
+        let microphones: Vec<_> = self.microphones.values().collect();
+        let screenshares: Vec<_> = self.screenshares.values().collect();
+        let cameras: Vec<_> = self
+            .cameras
+            .keys()
+            .flat_map(|path| procs_using_camera(path))
+            .collect();
 
         let mut rows: Vec<Element<Self::Message>> = vec![];
 
@@ -230,7 +215,8 @@ impl Application for PrivacyIndicator {
                         rows.push(
                             padded_control(
                                 Row::new()
-                                    .push(text::body(app.name.as_str()).width(Length::Fill))
+                                    .push(text::body(app.name.to_string()).width(Length::Fill))
+                                    .push(text::body(app.pid.to_string()))
                                     .push(kill_btn)
                                     .align_y(Alignment::Center),
                             )
@@ -241,9 +227,9 @@ impl Application for PrivacyIndicator {
             };
         }
 
-        section!("Camera", camera);
-        section!("Microphone", microphone);
-        section!("Screen Share", screenshare);
+        section!("Camera", cameras);
+        section!("Microphone", microphones);
+        section!("Screen Share", screenshares);
 
         self.core
             .applet
@@ -254,21 +240,26 @@ impl Application for PrivacyIndicator {
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
             Message::Tick => {
-                self.refresh_shared();
+                self.shared = Shared {
+                    microphone: !self.microphones.is_empty(),
+                    screenshare: !self.screenshares.is_empty(),
+                    camera: self
+                        .cameras
+                        .values()
+                        .fold(0, |acc, (shares, min)| acc + shares - min)
+                        > 0,
+                };
             }
             Message::CameraPrevious(cameras) => {
                 self.cameras = cameras;
-                self.refresh_shared();
             }
-            Message::CameraOpen(path, apps) => {
+            Message::CameraOpen(path) => {
                 self.cameras
                     .entry(path.clone())
                     .and_modify(|v| v.0 += 1)
                     .or_insert((1, 0));
-                self.camera_apps.insert(path, apps);
-                self.refresh_shared();
             }
-            Message::CameraClose(path, apps) => {
+            Message::CameraClose(path) => {
                 self.cameras
                     .entry(path.clone())
                     .and_modify(|v| {
@@ -276,26 +267,19 @@ impl Application for PrivacyIndicator {
                         v.1 = v.1.min(v.0);
                     })
                     .or_insert((0, 0));
-                self.camera_apps.insert(path, apps);
-                self.refresh_shared();
             }
             Message::CameraReset(path) => {
                 self.cameras.remove(&path);
-                self.camera_apps.remove(&path);
-                self.refresh_shared();
             }
             Message::ScreenShareAdd(id, info) => {
                 self.screenshares.insert(id, info);
-                self.refresh_shared();
             }
             Message::MicrophoneAdd(id, info) => {
                 self.microphones.insert(id, info);
-                self.refresh_shared();
             }
             Message::PipeWireNodeRemove(id) => {
                 self.screenshares.remove(&id);
                 self.microphones.remove(&id);
-                self.refresh_shared();
             }
             Message::RecTick(now) => {
                 self.timeline.now(now);
