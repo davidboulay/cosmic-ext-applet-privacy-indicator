@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -333,10 +335,9 @@ impl Application for PrivacyIndicator {
                 }
             }
             Message::KillProcess(pid) => {
-                std::process::Command::new("kill")
-                    .arg(pid.to_string())
-                    .spawn()
-                    .ok();
+                if let Err(e) = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM) {
+                    println!("Failed to kill process {pid}: {e}");
+                }
             }
             Message::Config(config) => self.config = config,
         }
