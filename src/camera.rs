@@ -7,11 +7,7 @@ use std::{
 use bimap::BiHashMap;
 use inotify::{Inotify, WatchDescriptor, WatchMask};
 
-#[derive(Debug, Clone, Default)]
-pub struct AppInfo {
-    pub name: String,
-    pub pid: u32,
-}
+use crate::applet::AppInfo;
 
 pub fn open_cameras() -> HashMap<PathBuf, (i32, i32)> {
     if std::path::Path::new("/.flatpak-info").exists() {
@@ -53,7 +49,7 @@ pub fn open_cameras() -> HashMap<PathBuf, (i32, i32)> {
 }
 
 /// Scans /proc to find all processes currently holding a file descriptor open on `device`.
-pub fn procs_using_camera(device: &Path) -> Vec<AppInfo> {
+pub fn procs_using_camera(device: &Path) -> Vec<AppInfo<'_>> {
     if std::path::Path::new("/.flatpak-info").exists() {
         return vec![];
     }
@@ -69,7 +65,7 @@ pub fn procs_using_camera(device: &Path) -> Vec<AppInfo> {
                 .all(|b| b.is_ascii_digit())
         })
         .filter_map(|pid_entry| {
-            let pid: u32 = pid_entry.file_name().to_string_lossy().parse().ok()?;
+            let id: u32 = pid_entry.file_name().to_string_lossy().parse().ok()?;
             let uses_device = read_dir(pid_entry.path().join("fd"))
                 .ok()?
                 .flatten()
@@ -80,10 +76,11 @@ pub fn procs_using_camera(device: &Path) -> Vec<AppInfo> {
             let name = std::fs::read_to_string(pid_entry.path().join("comm"))
                 .ok()?
                 .trim()
-                .to_string();
-            Some(AppInfo { name, pid })
+                .to_string()
+                .into();
+            Some(AppInfo { name, id })
         })
-        .filter(|info| seen_pids.insert(info.pid))
+        .filter(|info| seen_pids.insert(info.id))
         .collect()
 }
 

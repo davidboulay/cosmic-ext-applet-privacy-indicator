@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     path::PathBuf,
     rc::Rc,
-    sync::LazyLock,
+    sync::{LazyLock, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -30,14 +31,21 @@ use cosmic::{
 use cosmic_time::{Timeline, anim, chain};
 
 use inotify::EventMask;
-use pipewire::{context::ContextRc, main_loop::MainLoopRc};
+use pipewire::{channel::Sender, context::ContextRc, main_loop::MainLoopRc};
 
 use crate::{
-    Config,
-    camera::{AppInfo, get_inotify, open_cameras, procs_using_camera},
+    CONFIG_VERSION, Config,
+    camera::{get_inotify, open_cameras, procs_using_camera},
 };
 
 static REC_ICON: LazyLock<crate::rec_icon::Id> = LazyLock::new(crate::rec_icon::Id::unique);
+static PW_SENDER: OnceLock<Sender<u32>> = OnceLock::new();
+
+#[derive(Debug, Clone, Default)]
+pub struct AppInfo<'s> {
+    pub name: Cow<'s, str>,
+    pub id: u32,
+}
 
 #[derive(Default)]
 struct Shared {
@@ -51,8 +59,8 @@ pub struct PrivacyIndicator {
     core: Core,
     timeline: Timeline,
     shared: Shared,
-    microphones: HashMap<u32, AppInfo>,
-    screenshares: HashMap<u32, AppInfo>,
+    microphones: HashMap<u32, String>,
+    screenshares: HashMap<u32, String>,
     cameras: HashMap<PathBuf, (i32, i32)>,
     popup: Option<PopupId>,
     config: Config,
@@ -62,16 +70,18 @@ pub struct PrivacyIndicator {
 pub enum Message {
     Tick,
     RecTick(Instant),
-    ScreenShareAdd(u32, AppInfo),
-    MicrophoneAdd(u32, AppInfo),
+    ScreenShareAdd(u32, String),
+    MicrophoneAdd(u32, String),
     PipeWireNodeRemove(u32),
     CameraOpen(PathBuf),
     CameraClose(PathBuf),
     CameraPrevious(HashMap<PathBuf, (i32, i32)>),
     CameraReset(PathBuf),
+    DisconnectNode(u32),
     TogglePopup,
     ClosePopup(PopupId),
     KillProcess(u32),
+    Config(Config),
 }
 
 impl Application for PrivacyIndicator {
@@ -189,8 +199,22 @@ impl Application for PrivacyIndicator {
     }
 
     fn view_window(&self, _id: window::Id) -> Element<'_, Self::Message> {
-        let microphones: Vec<_> = self.microphones.values().collect();
-        let screenshares: Vec<_> = self.screenshares.values().collect();
+        let microphones: Vec<_> = self
+            .microphones
+            .iter()
+            .map(|(&id, name)| AppInfo {
+                name: name.into(),
+                id,
+            })
+            .collect();
+        let screenshares: Vec<_> = self
+            .screenshares
+            .iter()
+            .map(|(&id, name)| AppInfo {
+                name: name.into(),
+                id,
+            })
+            .collect();
         let cameras: Vec<_> = self
             .cameras
             .keys()
@@ -200,15 +224,15 @@ impl Application for PrivacyIndicator {
         let mut rows: Vec<Element<Self::Message>> = vec![];
 
         macro_rules! section {
-            ($label:expr, $apps:expr) => {
+            ($label:expr, $apps:expr, $id:ident) => {
                 if !$apps.is_empty() {
                     if !rows.is_empty() {
                         rows.push(divider::horizontal::default().into());
                     }
                     rows.push(padded_control(text::heading($label)).into());
                     for app in $apps {
-                        let kill_btn = button::destructive("Kill").on_press_maybe(if app.pid > 0 {
-                            Some(Message::KillProcess(app.pid))
+                        let kill_btn = button::destructive("Kill").on_press_maybe(if app.id > 0 {
+                            Some(Message::$id(app.id))
                         } else {
                             None
                         });
@@ -216,7 +240,7 @@ impl Application for PrivacyIndicator {
                             padded_control(
                                 Row::new()
                                     .push(text::body(app.name.to_string()).width(Length::Fill))
-                                    .push(text::body(app.pid.to_string()))
+                                    .push(text::body(app.id.to_string()))
                                     .push(kill_btn)
                                     .align_y(Alignment::Center),
                             )
@@ -227,9 +251,9 @@ impl Application for PrivacyIndicator {
             };
         }
 
-        section!("Camera", cameras);
-        section!("Microphone", microphones);
-        section!("Screen Share", screenshares);
+        section!("Camera", cameras, KillProcess);
+        section!("Microphone", microphones, DisconnectNode);
+        section!("Screen Share", screenshares, DisconnectNode);
 
         self.core
             .applet
@@ -303,6 +327,11 @@ impl Application for PrivacyIndicator {
             Message::ClosePopup(id) => {
                 self.popup.take_if(|stored_id| stored_id == &id);
             }
+            Message::DisconnectNode(id) => {
+                if let Some(sender) = PW_SENDER.get() {
+                    let _ = sender.send(id);
+                }
+            }
             Message::KillProcess(pid) => {
                 std::process::Command::new("kill")
                     .arg(pid.to_string())
@@ -354,7 +383,7 @@ impl PrivacyIndicator {
     }
 
     fn pipewire_subscription() -> Subscription<Message> {
-        Subscription::run(|| {
+        let pw = || {
             channel(100, |output| async {
                 std::thread::spawn(move || {
                     pipewire::init();
@@ -363,11 +392,20 @@ impl PrivacyIndicator {
                     let context = ContextRc::new(&main_loop, None)
                         .expect("Failed to create PipeWire context");
                     let core = context
-                        .connect(None)
+                        .connect_rc(None)
                         .expect("Failed to connect to PipeWire");
                     let registry = core
-                        .get_registry()
+                        .get_registry_rc()
                         .expect("Failed to get PipeWire registry");
+
+                    let (sender, receiver) = pipewire::channel::channel::<u32>();
+                    let _ = PW_SENDER.set(sender);
+
+                    let receiver_registry = registry.clone();
+                    let _attached = receiver.attach(main_loop.loop_(), move |id| {
+                        receiver_registry.destroy_global(id);
+                    });
+
                     let output_remove = output.clone();
                     let _listener = registry
                         .add_listener_local()
@@ -381,20 +419,15 @@ impl PrivacyIndicator {
                                 .or_else(|| props.get("node.name"))
                                 .unwrap_or("Unknown")
                                 .to_string();
-                            let pid = props
-                                .get("application.process.id")
-                                .and_then(|s| s.parse::<u32>().ok())
-                                .unwrap_or(0);
-                            let info = AppInfo { name, pid };
                             let Some(media_class) = props.get("media.class") else {
                                 return;
                             };
                             let msg = match media_class {
                                 "Stream/Input/Video" => {
-                                    Some(Message::ScreenShareAdd(global.id, info))
+                                    Some(Message::ScreenShareAdd(global.id, name))
                                 }
                                 "Stream/Input/Audio" => {
-                                    Some(Message::MicrophoneAdd(global.id, info))
+                                    Some(Message::MicrophoneAdd(global.id, name))
                                 }
                                 _ => None,
                             };
@@ -423,11 +456,12 @@ impl PrivacyIndicator {
                     main_loop.run();
                 });
             })
-        })
+        };
+        Subscription::run(pw)
     }
 
     fn inotify_subscription() -> Subscription<Message> {
-        Subscription::run(|| {
+        let inotify = || {
             channel(100, |mut output| async {
                 std::thread::spawn(move || {
                     let open_cameras = open_cameras();
@@ -477,8 +511,7 @@ impl PrivacyIndicator {
                                 }
                                 EventMask::OPEN => {
                                     wd_path.get_by_right(&event.wd).inspect(|&path| {
-                                        let apps = procs_using_camera(path);
-                                        let msg = Message::CameraOpen(path.clone(), apps);
+                                        let msg = Message::CameraOpen(path.clone());
                                         loop {
                                             match output.try_send(msg.clone()) {
                                                 Ok(()) => break,
@@ -491,8 +524,7 @@ impl PrivacyIndicator {
                                 }
                                 EventMask::CLOSE_WRITE | EventMask::CLOSE_NOWRITE => {
                                     wd_path.get_by_right(&event.wd).inspect(|&path| {
-                                        let apps = procs_using_camera(path);
-                                        let msg = Message::CameraClose(path.clone(), apps);
+                                        let msg = Message::CameraClose(path.clone());
                                         loop {
                                             match output.try_send(msg.clone()) {
                                                 Ok(()) => break,
@@ -509,6 +541,7 @@ impl PrivacyIndicator {
                     }
                 });
             })
-        })
+        };
+        Subscription::run(inotify)
     }
 }
