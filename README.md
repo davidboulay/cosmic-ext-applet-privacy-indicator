@@ -51,5 +51,5 @@ A [justfile](./justfile) is included with common recipes used by other COSMIC pr
 
 ## License
 
-Code is distributed with the [GPL-3.0-only license][./LICENSE]
+Code is distributed with the [GPL-3.0-only license](./LICENSE)
 
