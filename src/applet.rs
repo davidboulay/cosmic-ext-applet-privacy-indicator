@@ -242,7 +242,6 @@ impl Application for PrivacyIndicator {
                             padded_control(
                                 Row::new()
                                     .push(text::body(app.name.to_string()).width(Length::Fill))
-                                    .push(text::body(app.id.to_string()))
                                     .push(kill_btn)
                                     .align_y(Alignment::Center),
                             )
