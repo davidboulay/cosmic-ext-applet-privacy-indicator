@@ -43,6 +43,12 @@
     </binary>
   </provides>
   <releases>
+  <release version="0.3.0" date="2026-05-27">
+    <url type="details">https://github.com/D-Brox/cosmic-ext-applet-system-monitor/releases/tag/v0.3.0</url>
+    <description>
+      <p>Allow to disconnect nodes in pipewire or kill camera processes.</p>
+    </description>
+  </release>
   <release version="0.2.0" date="2026-02-10">
     <url type="details">https://github.com/D-Brox/cosmic-ext-applet-system-monitor/releases/tag/v0.2.0</url>
     <description>
