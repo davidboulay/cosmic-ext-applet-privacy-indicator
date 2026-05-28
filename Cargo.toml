@@ -11,7 +11,7 @@ bimap = "0.6.3"
 cosmic-time = { git = "https://github.com/pop-os/cosmic-time.git" }
 inotify = "0.11.0"
 nix = { version = "0.31.3", features = ["signal"] }
-pipewire = "0.9.2"
+pipewire = "0.10.0"
 serde = "1.0.228"
 
 [dependencies.libcosmic]
