@@ -4,6 +4,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::{
     borrow::Cow,
+    cell::RefCell,
     collections::HashMap,
     path::PathBuf,
     rc::Rc,
@@ -20,6 +21,7 @@ use cosmic::{
     iced::{
         Alignment, Background, Border, Length, Subscription,
         core::layout::Limits,
+        core::text::Wrapping,
         stream::channel,
         window::{self, Id as PopupId},
     },
@@ -33,7 +35,12 @@ use cosmic::{
 use cosmic_time::{Timeline, anim, chain};
 
 use inotify::EventMask;
-use pipewire::{channel::Sender, context::ContextRc, main_loop::MainLoopRc};
+use pipewire::{
+    channel::Sender,
+    context::ContextRc,
+    main_loop::MainLoopRc,
+    node::{Node, NodeListener},
+};
 
 use crate::{
     CONFIG_VERSION, Config,
@@ -46,6 +53,9 @@ static PW_SENDER: OnceLock<Sender<u32>> = OnceLock::new();
 #[derive(Debug, Clone, Default)]
 pub struct AppInfo<'s> {
     pub name: Cow<'s, str>,
+    /// A stream/device-specific label that distinguishes multiple entries from
+    /// the same app (e.g. OBS's "Desktop Audio" vs "Mic/Aux", or "video0").
+    pub detail: Option<Cow<'s, str>>,
     pub id: u32,
 }
 
@@ -61,8 +71,8 @@ pub struct PrivacyIndicator {
     core: Core,
     timeline: Timeline,
     shared: Shared,
-    microphones: HashMap<u32, String>,
-    screenshares: HashMap<u32, String>,
+    microphones: HashMap<u32, (String, Option<String>)>,
+    screenshares: HashMap<u32, (String, Option<String>)>,
     cameras: HashMap<PathBuf, (i32, i32)>,
     popup: Option<PopupId>,
     config: Config,
@@ -72,8 +82,10 @@ pub struct PrivacyIndicator {
 pub enum Message {
     Tick,
     RecTick(Instant),
-    ScreenShareAdd(u32, String),
-    MicrophoneAdd(u32, String),
+    ScreenShareAdd(u32, String, Option<String>),
+    MicrophoneAdd(u32, String, Option<String>),
+    /// Patches in a stream's `media.name` once the bound node reports it.
+    NodeDetail(u32, Option<String>),
     PipeWireNodeRemove(u32),
     CameraOpen(PathBuf),
     CameraClose(PathBuf),
@@ -204,23 +216,33 @@ impl Application for PrivacyIndicator {
         let microphones: Vec<_> = self
             .microphones
             .iter()
-            .map(|(&id, name)| AppInfo {
+            .map(|(&id, (name, detail))| AppInfo {
                 name: name.into(),
+                detail: detail.as_deref().map(Cow::from),
                 id,
             })
             .collect();
         let screenshares: Vec<_> = self
             .screenshares
             .iter()
-            .map(|(&id, name)| AppInfo {
+            .map(|(&id, (name, detail))| AppInfo {
                 name: name.into(),
+                detail: detail.as_deref().map(Cow::from),
                 id,
             })
             .collect();
         let cameras: Vec<_> = self
             .cameras
             .keys()
-            .flat_map(|path| procs_using_camera(path))
+            .flat_map(|path| {
+                // Tag each entry with the device (e.g. "video0") so multiple
+                // streams from the same process are distinguishable.
+                let device = path.file_name().map(|s| s.to_string_lossy().into_owned());
+                procs_using_camera(path).into_iter().map(move |mut app| {
+                    app.detail = device.clone().map(Cow::Owned);
+                    app
+                })
+            })
             .collect();
 
         let mut rows: Vec<Element<Self::Message>> = vec![];
@@ -238,11 +260,28 @@ impl Application for PrivacyIndicator {
                         } else {
                             None
                         });
+                        // The app name, plus the stream/device detail on a
+                        // second line. WordOrGlyph wrapping breaks even long
+                        // unbroken tokens (e.g. reverse-DNS ids) onto new lines
+                        // so the label never runs into the Kill button.
+                        let mut label = Column::new().push(
+                            text::body(app.name.to_string())
+                                .width(Length::Fill)
+                                .wrapping(Wrapping::WordOrGlyph),
+                        );
+                        if let Some(detail) = &app.detail {
+                            label = label.push(
+                                text::caption(detail.to_string())
+                                    .width(Length::Fill)
+                                    .wrapping(Wrapping::WordOrGlyph),
+                            );
+                        }
                         rows.push(
                             padded_control(
                                 Row::new()
-                                    .push(text::body(app.name.to_string()).width(Length::Fill))
+                                    .push(label.width(Length::Fill))
                                     .push(kill_btn)
+                                    .spacing(8)
                                     .align_y(Alignment::Center),
                             )
                             .into(),
@@ -296,11 +335,20 @@ impl Application for PrivacyIndicator {
             Message::CameraReset(path) => {
                 self.cameras.remove(&path);
             }
-            Message::ScreenShareAdd(id, info) => {
-                self.screenshares.insert(id, info);
+            Message::ScreenShareAdd(id, name, detail) => {
+                self.screenshares.insert(id, (name, detail));
             }
-            Message::MicrophoneAdd(id, info) => {
-                self.microphones.insert(id, info);
+            Message::MicrophoneAdd(id, name, detail) => {
+                self.microphones.insert(id, (name, detail));
+            }
+            Message::NodeDetail(id, detail) => {
+                // The node lives in whichever map its Add message populated.
+                if let Some(entry) = self.microphones.get_mut(&id) {
+                    entry.1 = detail.clone();
+                }
+                if let Some(entry) = self.screenshares.get_mut(&id) {
+                    entry.1 = detail;
+                }
             }
             Message::PipeWireNodeRemove(id) => {
                 self.screenshares.remove(&id);
@@ -407,6 +455,12 @@ impl PrivacyIndicator {
                     });
 
                     let output_remove = output.clone();
+                    // Keep the bound Node proxies + their info listeners alive so
+                    // their `info` events keep firing; dropped on global_remove.
+                    let bound: Rc<RefCell<HashMap<u32, (Node, NodeListener)>>> =
+                        Rc::new(RefCell::new(HashMap::new()));
+                    let bound_remove = bound.clone();
+                    let bind_registry = registry.clone();
                     let _listener = registry
                         .add_listener_local()
                         .global(move |global| {
@@ -424,10 +478,10 @@ impl PrivacyIndicator {
                             };
                             let msg = match media_class {
                                 "Stream/Input/Video" => {
-                                    Some(Message::ScreenShareAdd(global.id, name))
+                                    Some(Message::ScreenShareAdd(global.id, name.clone(), None))
                                 }
                                 "Stream/Input/Audio" => {
-                                    Some(Message::MicrophoneAdd(global.id, name))
+                                    Some(Message::MicrophoneAdd(global.id, name.clone(), None))
                                 }
                                 _ => None,
                             };
@@ -441,9 +495,34 @@ impl PrivacyIndicator {
                                         }
                                     }
                                 }
+                                // `media.name` (the per-stream label, e.g. OBS's
+                                // "Desktop Audio" vs "Mic/Aux") isn't in the
+                                // registry global props — bind the node and read
+                                // it from the node's info event, then patch it in.
+                                if let Ok(node) = bind_registry.bind::<Node, _>(global) {
+                                    let detail_out = output.clone();
+                                    let node_id = global.id;
+                                    let app_name = name;
+                                    let listener = node
+                                        .add_listener_local()
+                                        .info(move |info| {
+                                            let detail = info
+                                                .props()
+                                                .and_then(|p| {
+                                                    p.get("media.name").map(str::to_string)
+                                                })
+                                                .filter(|d| !d.is_empty() && *d != app_name);
+                                            let _ = detail_out
+                                                .clone()
+                                                .try_send(Message::NodeDetail(node_id, detail));
+                                        })
+                                        .register();
+                                    bound.borrow_mut().insert(node_id, (node, listener));
+                                }
                             }
                         })
                         .global_remove(move |id| {
+                            bound_remove.borrow_mut().remove(&id);
                             let mut out = output_remove.clone();
                             loop {
                                 match out.try_send(Message::PipeWireNodeRemove(id)) {

@@ -78,7 +78,11 @@ pub fn procs_using_camera(device: &Path) -> Vec<AppInfo<'_>> {
                 .trim()
                 .to_string()
                 .into();
-            Some(AppInfo { name, id })
+            Some(AppInfo {
+                name,
+                detail: None,
+                id,
+            })
         })
         .filter(|info| seen_pids.insert(info.id))
         .collect()

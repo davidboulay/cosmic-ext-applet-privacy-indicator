@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-ext-applet-privacy-indicator"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bimap",
  "cosmic-time",
