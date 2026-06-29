@@ -295,6 +295,18 @@ impl Application for PrivacyIndicator {
         section!("Microphone", microphones, DisconnectNode);
         section!("Screen Share", screenshares, DisconnectNode);
 
+        // Never render an empty (invisible) popup: if nothing is actually in use
+        // — e.g. the indicator briefly lingers before the next reconcile tick —
+        // say so rather than showing a blank box.
+        if rows.is_empty() {
+            rows.push(
+                padded_control(text::body(
+                    "Nothing is currently using your camera, microphone, or screen.",
+                ))
+                .into(),
+            );
+        }
+
         self.core
             .applet
             .popup_container(Column::with_children(rows))
@@ -304,6 +316,20 @@ impl Application for PrivacyIndicator {
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
             Message::Tick => {
+                // The inotify open/close counter can get stuck "on" if a CLOSE
+                // is ever missed — e.g. the watches are rebuilt (get_inotify) when
+                // a virtual-camera/v4l2loopback device is added/removed, dropping
+                // an in-flight close. Whenever we believe a camera is in use,
+                // reconcile against the real fd holders (the same ground truth the
+                // popup uses) so a stale count self-heals within one tick.
+                let believed_on = self
+                    .cameras
+                    .values()
+                    .fold(0, |acc, (shares, min)| acc + shares - min)
+                    > 0;
+                if believed_on {
+                    self.cameras = open_cameras();
+                }
                 self.shared = Shared {
                     microphone: !self.microphones.is_empty(),
                     screenshare: !self.screenshares.is_empty(),
